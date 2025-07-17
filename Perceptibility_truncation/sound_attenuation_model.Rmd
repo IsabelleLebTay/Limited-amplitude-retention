@@ -1,0 +1,200 @@
+---
+title: "Sound Attenuation Analysis in Open and Forested Habitats"
+author: "Isabelle Lebeuf-Taylor"
+date: "2024-09-25"
+output: 
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+description: >
+  This R Markdown document analyzes sound attenuation in open and forested habitats. 
+  It includes data preparation, model fitting using glmmTMB, model selection 
+  based on AICc, diagnostics of the best model, visualization of predictions, 
+  and k-fold cross-validation. The analysis focuses on how sound amplitude 
+  changes with distance, considering factors such as habitat type (open or 
+  forested), species, and recording equipment (SM2 status).
+tags:
+  - acoustic ecology
+  - sound attenuation
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load Required Packages
+
+```{r load-packages, message=FALSE, warning=FALSE}
+library(tidyverse)
+library(glmmTMB)
+library(ggplot2)
+library(gridExtra)
+library(DHARMa)
+library(MuMIn)
+library(caret)
+```
+
+## Load and Prepare Data
+
+```{r load-data}
+# Load data
+ampl_dist_spp <- read_csv("Data/ampl_dist_spp.csv")
+location_sm2 <- read_csv("Data/locations_sm2_status.csv")
+
+# Join datasets and prepare variables
+ampl_dist_spp <- ampl_dist_spp %>%
+  inner_join(location_sm2, by = "location", relationship = "many-to-many") %>%
+  mutate(
+    mean_amp = rowMeans(select(., left_amplitude, right_amplitude)),
+    BinForest = factor(ifelse(forest == "OP", "OP", "FO")),
+    ForestDummy = factor(as.numeric(BinForest == "FO")),
+    species_code = factor(species_code),
+    SM2 = factor(SM2),
+    distance = as.numeric(distance)
+  )
+```
+
+## Model Fitting
+
+```{r model-fitting}
+models <- list(
+  null = lm(mean_amp ~ offset(I(-10*log10(distance^2))), data = ampl_dist_spp),
+  species = glmmTMB(mean_amp ~ (1|species_code) + offset(I(-10*log10(distance^2))), data = ampl_dist_spp),
+  forest = glmmTMB(mean_amp ~ BinForest + (1|species_code) + offset(I(-10*log10(distance^2))), data = ampl_dist_spp),
+  distance = glmmTMB(mean_amp ~ distance + (1|species_code) + offset(I(-10*log10(distance^2))), data = ampl_dist_spp),
+  full = glmmTMB(mean_amp ~ distance*BinForest + SM2 + (1|species_code) + offset(I(-10*log10(distance^2))), data = ampl_dist_spp)
+)
+```
+
+## Model Selection
+
+```{r model-selection}
+model_selection <- AICc(models$null, models$species, models$forest, models$distance, models$full)
+print(model_selection)
+```
+
+## Best Model Diagnostics
+
+```{r model-diagnostics}
+best_model <- models$full
+plot(simulateResiduals(best_model))
+print(summary(best_model))
+print(r.squaredGLMM(best_model))
+```
+
+## Visualization of Predictions
+
+```{r predictions-visualization, fig.width=12, fig.height=6}
+select_species <- c("BRBL", "WEME", "VESP", "CCSP", "AMRO")
+
+dist_range <- seq.int(min(ampl_dist_spp$distance), 500, length.out = 500)
+
+pred_data_OP <- expand.grid(distance = dist_range, species_code = select_species, 
+                            BinForest = "OP",
+                            SM2 = 0)
+pred_data_FO <- expand.grid(distance = dist_range, species_code = select_species, 
+                            BinForest = "FO",
+                            SM2 = 0)
+
+OP_pred <- predict(best_model, newdata = pred_data_OP, type = "response", se.fit = TRUE)
+FO_pred <- predict(best_model, newdata = pred_data_FO, type = "response", se.fit = TRUE)
+
+pred_data_OP$lwr <- OP_pred$fit - 1.96*OP_pred$se.fit
+pred_data_OP$upr <- OP_pred$fit + 1.96*OP_pred$se.fit
+
+pred_data_FO$lwr <- FO_pred$fit - 1.96*FO_pred$se.fit
+pred_data_FO$upr <- FO_pred$fit + 1.96*FO_pred$se.fit
+
+pred_data_OP$predicted <- predict(best_model, newdata = pred_data_OP, type = "response", se.fit = TRUE)$fit
+pred_data_FO$predicted <- predict(best_model, newdata = pred_data_FO, type = "response", se.fit = TRUE)$fit
+
+pred_data_OP <- pred_data_OP |>
+                        mutate(species_code = str_trim(species_code)) |>
+                        filter(toupper(species_code) %in% toupper(select_species))
+
+pred_data_FO <- pred_data_FO |>
+                        mutate(species_code = str_trim(species_code)) |>
+                        filter(toupper(species_code) %in% toupper(select_species))
+
+OP_ampl_dist_spp <- ampl_dist_spp |>
+                    filter(BinForest == "OP")
+
+OP_plot <- pred_data_OP |>
+  ggplot(aes(x = distance, y = predicted, color = species_code)) +
+  geom_ribbon(aes(x = distance, ymin = lwr, ymax = upr), fill = 'grey',  alpha = .3, linetype = 0) + 
+  geom_line() +
+  geom_point(aes(x = distance, y = mean_amp, color = species_code), alpha = .5,
+            data = OP_ampl_dist_spp, inherit.aes = FALSE) +
+  labs(title = "Open") +
+  theme_minimal() +
+  ylab(expression("Signal strength " ~ italic(S)[mu] ~ "(dBFS)")) +
+  xlab("Distance (m)") +
+  ylim(-60, 0) +
+  xlim(1, 250) +
+  theme(legend.position = "none",
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank())
+
+FO_ampl_dist_spp <- ampl_dist_spp |>
+                    filter(BinForest == "FO")
+
+FO_plot <-  pred_data_FO |>
+  ggplot(aes(x = distance, y = predicted, color = species_code)) +
+  geom_ribbon(aes(x = distance, ymin = lwr, ymax = upr), fill = 'grey',  alpha = .3, linetype = 0) + 
+  geom_line() +
+  geom_point(aes(x = distance, y = mean_amp, color = species_code), alpha = .5,
+            data = FO_ampl_dist_spp, inherit.aes = FALSE) +
+  labs(title = "Forested") +
+  theme_minimal() +
+  ylab(expression("Signal strength " ~ italic(S)[mu] ~ "(dBFS)")) +
+  xlab("Distance (m)") +
+  ylim(-60, 0) +
+  xlim(1, 250) +
+  labs(color = "Species") +
+  theme(legend.position.inside = c(.9, 0.75),
+        axis.text.x = element_text(size = 12),
+        axis.text.y = element_text(size = 12),
+        axis.title = element_text(size = 14),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        panel.background = element_blank()) 
+
+combined_plots <- grid.arrange(OP_plot, FO_plot, ncol = 2)
+```
+
+## K-fold Cross-validation
+
+```{r cross-validation}
+set.seed(123)
+folds <- createFolds(ampl_dist_spp$mean_amp, k = 10, list = TRUE)
+
+cv_results <- lapply(folds, function(test_indices) {
+  train_data <- ampl_dist_spp[-test_indices, ]
+  test_data <- ampl_dist_spp[test_indices, ]
+  
+  model <- glmmTMB(mean_amp ~ distance*BinForest + SM2 + (1|species_code) + offset(I(-10*log10(distance^2))), data = train_data)
+  predictions <- predict(model, newdata = test_data, type = "response")
+  
+  c(RMSE = sqrt(mean((predictions - test_data$mean_amp)^2)),
+    MAE = mean(abs(predictions - test_data$mean_amp)))
+})
+
+cv_summary <- data.frame(
+  RMSE = sapply(cv_results, `[[`, "RMSE"),
+  MAE = sapply(cv_results, `[[`, "MAE")
+)
+
+print(summary(cv_summary))
+```
+
+## Save Results
+
+```{r save-results}
+save(ampl_dist_spp, models, best_model, cv_summary, 
+     file = "analysis_results.RData")
+```
